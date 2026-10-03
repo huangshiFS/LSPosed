@@ -31,15 +31,37 @@
 
 ## 2. 阶段计划
 
-### P0 — 构建环境就绪（0.5 天，本机即可完成）
-| # | 任务 | 验收标准 |
-|---|---|---|
-| 0.1 | `git submodule update --init --recursive`（9 个子模块） | `git submodule status` 无 `-` 前缀 |
-| 0.2 | 创建 `local.properties` 指向 `~/Library/Android/sdk` | gradle 不再报 SDK 缺失 |
-| 0.3 | `./gradlew :zygisk:assembleRelease :manager:assembleRelease` | 产出 zygisk 模块 zip 与 manager apk |
-| 0.4 | 记录构建产物哈希存档 | `docs/research/builds/` 记录 sha256 + commit |
+### P0 — 构建环境就绪（进行中）
 
-**风险**：子模块走 HTTPS 需过代理（本机代理 127.0.0.1:65353，git 已验证 SSH 可用；HTTPS 502 需切代理或改 SSH）。若卡壳 → 用 `git config url."git@github.com:".insteadOf "https://github.com/"` 兜底。
+| # | 任务 | 验收标准 | 状态 |
+|---|---|---|---|
+| 0.1 | `git submodule update --init --recursive`（9 个子模块） | 无 `-` 前缀 | ✅ 已解决（见下方阻塞项） |
+| 0.2 | 创建 `local.properties` 指向 `~/Library/Android/sdk` | gradle 不再报 SDK 缺失 | ✅ 已创建（gitignore 内） |
+| 0.3 | `./gradlew :zygisk:assembleRelease :manager:assembleRelease` | 产出 zygisk 模块 zip 与 manager apk | ✅ BUILD SUCCESSFUL（3m33s） |
+| 0.4 | 记录构建产物哈希存档 | `docs/research/builds.md` 记录 sha256 + commit | ✅ 已生成 |
+| 0.5 | Gradle 分发包预下载 | `./gradlew -v` 通过 | ✅ Gradle 9.7.0 / JDK 21.0.12 |
+| 0.6 | **CMake ≥ 3.29.8** | AGP 不再报 CXX1300 | ✅ 已装 `cmake;3.31.6`（原 SDK 仅有 3.22.1） |
+
+> **P0 三个坑（已全部填平，照此可复现）**
+> 1. `libxposed` 组织被 GitHub 封 → 用 JingMatrix 镜像（见下）；
+> 2. 子模块 clone 后停在各自 master 而非钉住 SHA → `MemberUtils` 找不到导致 `:external:apache:compileJava` 失败，需 `git submodule update --init --recursive --checkout --force`（且 HTTPS 走代理 502，必须加 `-c url."git@github.com:".insteadOf="https://github.com/"`）；
+> 3. SDK 自带 CMake 3.22.1 版本过低 → `sdkmanager --install "cmake;3.31.6"`。
+
+#### ⚠️ P0 阻塞项：`libxposed` 组织已被 GitHub 封锁
+
+- 现象：`services/libxposed`（原 `libxposed/service.git`）与 `xposed/libxposed`（原 `libxposed/api.git`）clone 报 `Repository not found`（404）。
+- 根因：libxposed 组织本月被 GitHub flag，官方公告建议从 Maven Central 获取（`repo.maven.apache.org/maven2/io/github/libxposed`）；文档站 `libxposed.github.io` 也已 404。
+- **解法（已验证）**：作者 JingMatrix 维护了同名镜像仓库，且 HEAD 与 `.gitmodules` 钉住的 SHA **完全一致**，可直接替换：
+  - `xposed/libxposed` → `git@github.com:JingMatrix/libxposed-api.git`（SHA `39cac08…` 一致）
+  - `services/libxposed` → `git@github.com:JingMatrix/libxposed-service.git`（SHA `3318940…` 一致）
+- 落地方式：**只做本地覆盖，不提交 `.gitmodules`**（避免与上游配置冲突）：
+  ```bash
+  git config submodule.xposed/libxposed.url   git@github.com:JingMatrix/libxposed-api.git
+  git config submodule.services/libxposed.url git@github.com:JingMatrix/libxposed-service.git
+  git submodule update --init xposed/libxposed services/libxposed
+  ```
+- 备用方案：Maven Central 依赖 `io.github.libxposed:api:102.0.0` / `:service`（仅含 aar/sources，无构建脚本，需改 gradle 配置，优先级低）。
+- 文档镜像：`https://jingmatrix.github.io/libxposed-api/` 与 `.../libxposed-service/`。
 
 ### P1 — 真机基线检测（1 天，需 Pixel 6 或 OnePlus 9 Pro）
 | # | 任务 | 验收标准 |
