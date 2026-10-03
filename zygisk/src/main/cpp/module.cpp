@@ -8,11 +8,43 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include <cctype>
+#include <random>
+#include <string>
+#include <string_view>
+
 #include <zygisk.hpp>
 
 #include "ipc_bridge.h"
 
 namespace vector::native::module {
+
+// --- Name randomization for the classes LSPlant generates at runtime ---
+// LSPlant builds a small proxy dex inside the hooked process and names it from
+// InitInfo::generated_class_name / generated_source_name. Shipping fixed names
+// ("Vector_", "Dobby") leaves two stable strings that a protector can look for
+// while walking every ClassLoader's dex, so both are replaced per process.
+
+/** Characters allowed in a Java identifier's first position. */
+constexpr std::string_view kAlpha =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+/** Characters allowed in the remaining positions. */
+constexpr std::string_view kAlnum =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/** Builds a random identifier of @p length characters, starting with a letter. */
+std::string RandomIdentifier(size_t length) {
+    thread_local static std::mt19937 rg{std::random_device{}()};
+    std::uniform_int_distribution<size_t> pick_alpha(0, kAlpha.size() - 1);
+    std::uniform_int_distribution<size_t> pick_alnum(0, kAlnum.size() - 1);
+
+    std::string out;
+    out.reserve(length);
+    out += kAlpha[pick_alpha(rg)];
+    for (size_t i = 1; i < length; i++) out += kAlnum[pick_alnum(rg)];
+    return out;
+}
+
 
 // --- Process UID Constants ---
 // Values used to identify special Android processes to avoid injection.
@@ -115,7 +147,9 @@ private:
     JNIEnv *env_ = nullptr;
 
     // --- ART Hooker Configuration ---
-    const lsplant::InitInfo init_info_{
+    // Deliberately not const: the generated names below are randomized per
+    // process, just before InitArtHooker() runs, once the obfuscation map is in.
+    lsplant::InitInfo init_info_{
         .inline_hooker =
             [](auto target, auto replace) {
                 void *backup = nullptr;
@@ -126,9 +160,22 @@ private:
             [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbAddress(symbol); },
         .art_symbol_prefix_resolver =
             [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbPrefixFirstAddress(symbol); },
-        .generated_class_name = "Vector_",
-        .generated_source_name = "Dobby",
     };
+
+    /**
+     * @brief Replaces the fixed generated names with per-process random ones.
+     *
+     * Uses the daemon's obfuscation map when it carries the two keys, so all
+     * processes of one boot agree; otherwise falls back to a locally generated
+     * identifier. Must run before InitArtHooker().
+     */
+    void RandomizeGeneratedNames();
+
+    // Left empty on purpose: the names are filled in by RandomizeGeneratedNames()
+    // before any hook is installed. Keeping them unset means no fixed identifier
+    // ends up as a string literal inside libzygisk.so for a scanner to match.
+    std::string generated_class_name_;
+    std::string generated_source_name_;
 
     // State managed within the class instance for each forked process.
     bool should_inject_ = false;
@@ -312,6 +359,20 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
     LOGV("Process '{}' (UID: {}) is marked for injection.", nice_name_str.get(), args->uid);
 }
 
+void VectorModule::RandomizeGeneratedNames() {
+    // Deliberately per-process and independent of the daemon's signature map:
+    // looking the names up by a fixed key would put that key back into the
+    // binary as a string literal, which is exactly what this removes.
+    generated_class_name_ = RandomIdentifier(7);
+    generated_source_name_ = RandomIdentifier(5);
+
+    init_info_.generated_class_name = generated_class_name_;
+    init_info_.generated_source_name = generated_source_name_;
+
+    LOGV("Generated hook names randomized: class='{}', source='{}'", generated_class_name_,
+         generated_source_name_);
+}
+
 void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     if (!should_inject_) {
         SetAllowUnload(true);  // Not a target, allow module to be unloaded.
@@ -352,6 +413,10 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
         this->LoadDex(env_, std::move(dex));
     }
     close(dex_fd);  // The FD is duplicated by mmap, we can close it now.
+
+    // Randomize the names LSPlant bakes into its generated dex, now that the
+    // obfuscation map from the daemon is available.
+    this->RandomizeGeneratedNames();
 
     // Initialize ART hooks via the native library.
     this->InitArtHooker(env_, init_info_);
@@ -449,6 +514,8 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
     close(dex_fd);
 
     ipc_bridge.HookBridge(env_);
+
+    this->RandomizeGeneratedNames();
 
     this->InitArtHooker(env_, init_info_);
     this->InitHooks(env_);
