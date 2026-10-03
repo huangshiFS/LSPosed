@@ -27,6 +27,11 @@ std::map<std::string, std::string> signatures = {
     {"Landroid/content/res/XRes", ""},        {"Landroid/content/res/XModule", ""},
     {"Lio/github/libxposed/api/Xposed", ""},  {"Lorg/matrix/vector/core/", ""},
     {"Lorg/matrix/vector/nativebridge/", ""}, {"Lorg/matrix/vector/service/", ""},
+    // T1: signatures left inside third-party module dexes. Modules written against the legacy
+    // LSPosed API, or bundling their own hook libraries, keep these package prefixes in their
+    // dex string pool, where a protector scanning every ClassLoader's dex will find them.
+    {"Lorg/lsposed/", ""},                    {"Lcom/swift/sandhook/", ""},
+    {"Lme/weishu/epic/", ""},
 };
 
 jclass class_file_descriptor = nullptr;
