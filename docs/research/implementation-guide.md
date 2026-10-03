@@ -58,10 +58,10 @@ postAppSpecialize
 
 | # | 缺口 | 证据 |
 |---|---|---|
-| G1 | `obfuscateDex` JNI 已实现但**无 Java 调用方**（无 `ObfuscationManager` 类） | 全仓库 grep 无 `ObfuscationManager` 引用；`daemon/src/main/kotlin` 下只有 `Cli.kt`/`VectorDaemon.kt` |
-| G2 | LSPlant 生成代理类的名字硬编码 `Vector_`、来源名 `Dobby` → dex 里可扫 | `module.cpp:init_info_`（`generated_class_name = "Vector_"`, `generated_source_name = "Dobby"`） |
-| G3 | 第三方**模块 dex**（非框架 dex）未走混淆 | obfuscation 只覆盖 8 组框架签名 |
-| G4 | `init_info_.inline_hooker` 仍挂 Dobby → 存在 inline hook 痕迹风险 | `module.cpp:init_info_`（`HookInline/UnhookInline`） |
+| ~~G1~~ | ~~`obfuscateDex` 无 Java 调用方~~ | **判断有误（已更正）**：`ObfuscationManager.kt` 存在且已接线 —— `FileSystem.readDex()` 调 `obfuscateDex()`、`loadModule()`/`getPreloadDex()` 均按 `ConfigCache.state.isDexObfuscateEnabled` 走混淆，该开关 release 版默认 `true`（`DaemonState.kt:15`，`!BuildConfig.DEBUG`）。此前结论源于一次被 `head` 截断的 grep，勿据此改代码 |
+| ~~G2~~ | LSPlant 生成代理类名硬编码 `Vector_` / `Dobby` | ✅ **已修复（T4，commit `70462655`）** —— 改为每进程随机，`strings libzygisk.so` 已无这两个字面量 |
+| ~~G3~~ | 第三方模块 dex 未走混淆 | **判断有误（部分更正）**：模块 dex 本身**会**走混淆（`FileSystem.loadModule()` 对 `classes*.dex` 逐个 `readDex(obfuscate=true)`）。真实缺口是**签名表只覆盖 8 组框架前缀**，模块自带的遗留特征串漏网 → ✅ **已修复（T1，commit `9b1357ed`）** |
+| G4 | `init_info_.inline_hooker` 仍挂 Dobby → 存在 inline hook 痕迹风险 | `module.cpp:init_info_`（`HookInline/UnhookInline`），**待办（T5）** |
 | G5 | 框架自身线程名、so 名、ClassLoader 可被枚举 | 无随机化逻辑 |
 | G6 | 无 maps/smaps/map_files 内容过滤能力 | 仅"自己不读 maps"，但**目标 App 会读** |
 | G7 | 无 solist / link_map 摘除 | — |
@@ -101,46 +101,45 @@ vector.hide.solist_prune         = false   // T8（默认关：有死锁风险�
 
 ## 4. 实现任务
 
-### T1 — 生成随机签名表（daemon 侧）
-**改动**：`daemon/src/main/jni/obfuscation.cpp`（已有 `regen()`），新增导出 `getSignaturesForModules()`
-- 现有 8 组：`Lde/robv/android/xposed/`、`Landroid/app/AndroidApp`、`Landroid/content/res/XRes`、`Landroid/content/res/XModule`、`Lio/github/libxposed/api/Xposed`、`Lorg/matrix/vector/core/`、`Lorg/matrix/vector/nativebridge/`、`Lorg/matrix/vector/service/`；
-- **追加**：扫描已启用模块 APK 的 dex 字符串表，自动提取形如 `Lxxx/ModuleMain;`、`Lde/robv/...`、`Lorg/lsposed/...`、`XposedBridge`、`XC_MethodHook` 的用户自定义特征串一并纳入 `signatures`（长度对齐规则复用 `regen`，保证 dex 结构不变）；
-- 约束：**替换串与被替换串长度必须相等**（现有代码已校验 `out.length() != original.length()` 并 LOGE）。
+### T1 — 生成随机签名表（daemon 侧） ✅ 已落地（commit `9b1357ed`，分支 `code/T1-extend-signatures`）
 
-**验收**：`adb logcat | grep ObfuscationManager` 可见 N 条 `xxx => yyy`；重启后签名表不同。
+**已做**：在 `daemon/src/main/jni/obfuscation.cpp` 的 `signatures` 表追加 3 组模块侧特征串：
+- `Lorg/lsposed/`（按旧版 API 写的模块）
+- `Lcom/swift/sandhook/`（模块自带 SandHook）
+- `Lme/weishu/epic/`（模块自带 Epic）
 
-### T2 — 接线 `ObfuscationManager`（补 G1）
-**改动**：新增 `daemon/src/main/kotlin/org/matrix/vector/daemon/utils/ObfuscationManager.kt`
-```kotlin
-object ObfuscationManager {
-    external fun getSignatures(): Map<String, String>          // T1 产出
-    external fun obfuscateDex(memory: SharedMemory): SharedMemory?  // 已实现的 JNI
-}
-```
-调用点（两处）：
-1. **框架 dex 下发前**：`FetchFrameworkDex` 的服务端实现处，把 dex 写入 `SharedMemory` → `obfuscateDex()` → 再把结果 fd 返回给 zygisk；
-2. **模块 dex 下发前**：模块 APK 解出 dex → 同样过一遍。
+`regen()` 保证替换串与被替换串**等长**（dex 结构不变），`FileSystem.loadModule()` 会用同一张表改写 `moduleClassNames`，因此这三组同时作用于 dex 字符串与模块类名。
 
-**注意**（源码注释已警示）：JNI 侧 `mmap` 必须 `MAP_SHARED`，SharedMemory 用 `MAP_PRIVATE` 会被 COW 层吞掉内容导致 slicer 失败。
+**剩余（T1b，未做）**：自动扫描模块 dex 字符串表动态扩充签名。难点是时序——签名表必须在任何 dex 被混淆之前生成，动态扩充需要「先扫全部模块 dex 再统一混淆」的两阶段加载，改动面较大，列为后续课题。
 
-**验收**：目标进程内 `adb shell cat /proc/<pid>/maps` 无模块路径；dex 内 grep 不到 `XposedBridge`。
+**验收**：`adb logcat -s Vector | grep -i obfuscat` 可见新增三组 `xxx => yyy`；重启后不同。
 
-### T3 — 签名表下发（已有，补模块签名）
-`module.cpp:347` 的 `FetchObfuscationMap` 已打通；只需保证 T1 扩展后的 map 也走同一通道，并在 `SetupEntryClass`/`resources_hook`/`hook_bridge` 用 `.at()` 前做 `find()` 兜底（避免缺 key 抛异常导致注入失败）。
+### T2 — 接线 `ObfuscationManager` ✅ 上游已实现，无需改动
 
-### T4 — LSPlant 生成类名随机化（去 `Vector_` / `Dobby`）
-**改动**：`zygisk/src/main/cpp/module.cpp` 的 `init_info_` 改为运行时生成：
-```cpp
-const lsplant::InitInfo init_info_{
-    .inline_hooker = ...,                     // 见 T5
-    .art_symbol_resolver = ...,
-    .generated_class_name = RandomName("Vector_"),   // 形如 "aX7kQ_"，每次 boot 随机
-    .generated_source_name = RandomName("Dobby"),    // 关键: dex 里不再出现 "Dobby"
-};
-```
-`RandomName()` 从 `ConfigBridge::obfuscation_map()` 取，保证 daemon 与进程内一致（Java 侧若需引用代理类也要走 map）。
+实际代码（此前判断有误，以代码为准）：
+- `daemon/.../utils/ObfuscationManager.kt` 已存在（`external fun obfuscateDex/getSignatures`）；
+- `FileSystem.readDex(inputStream, obfuscate)` → `ObfuscationManager.obfuscateDex(memory)`；
+- 调用方：`FileSystem.loadModule(apkPath, obfuscate)`（模块全部 `classes*.dex`）、`FileSystem.getPreloadDex(obfuscate)`（`framework/vector.dex`）；
+- 开关：`ConfigCache.state.isDexObfuscateEnabled`，默认 `!BuildConfig.DEBUG`（release 版开启）；
+- `FileSystem.loadModule` 还会用 `getSignatures()` 改写 `moduleClassNames`。
 
-**验收**：`adb shell` 进进程 `/proc/<pid>/maps` 抓 dex → `strings` 无 `Vector_`/`Dobby`；Hunter 的 dex 扫描项不报。
+**注意**（源码注释已警示）：JNI 侧 `mmap` 必须 `MAP_SHARED`，`MAP_PRIVATE` 会因 COW 读到零页导致 slicer 失败。
+
+### T3 — 签名表下发 ✅ 已有（`module.cpp` FetchObfuscationMap → ConfigBridge）
+
+待补：`.at()` 取签名前加 `find()` 兜底，避免 map 缺 key 抛异常导致注入失败（当前 `SetupEntryClass`/`resources_hook`/`hook_bridge`/`ipc_bridge` 均为直接 `.at()`）。
+
+### T4 — LSPlant 生成类名随机化 ✅ 已落地（commit `70462655`，分支 `code/T4-randomize-generated-names`）
+
+实现（`zygisk/src/main/cpp/module.cpp`）：
+- 新增 `RandomIdentifier(len)`：首字母必为字母，其余字母/数字，产出合法 Java 标识符；
+- `init_info_` 由 `const` 改为可写，去掉 `generated_class_name = "Vector_"` / `generated_source_name = "Dobby"` 两个字面量；
+- 新增 `RandomizeGeneratedNames()`，在**两条注入路径**（`postAppSpecialize`、`postServerSpecialize`）里、拿到混淆表之后、`InitArtHooker()` 之前调用；
+- 名字存于 `VectorModule` 成员（`InitInfo` 只持有 `string_view`，必须保证生命周期覆盖 `lsplant::Init()`）；
+- **不查 map 的固定 key**（那会把 key 重新变成字面量），改为每进程本地随机。
+
+**验证**：`strings libzygisk.so | grep -c '^Dobby$'` → 0；`^Vector_$` → 0。
+**残留**：LSPlant 上游自带的默认名 `LSPHooker_` 仍在二进制中（上游字面量，运行时不使用）。
 
 ### T5 — 去除 inline hook 痕迹（G4）
 **原则**：视频结论 + 本仓库路线 = **不在任何系统库 .text 上做 inline patch**。
